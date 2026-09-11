@@ -149,5 +149,8 @@ AsyncTask<void> connect_to_server() {
 
 ## License
 
-Apache License 2.0 — see the headers of the `.hpp` files.
-```
+Apache License 2.0
+
+---
+
+**Author:** Pooria Yousefi
