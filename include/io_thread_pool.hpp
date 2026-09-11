@@ -5,6 +5,7 @@
 // ============================================================================
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <deque>
@@ -99,6 +100,19 @@ namespace pooriayousefi::io_bound
             READABLE,
             WRITABLE
         };
+
+        struct ScheduleAwaitable
+        {
+            NetworkReactor* reactor;
+            bool await_ready() const noexcept { return false; }
+            void await_suspend(std::coroutine_handle<> h) const
+            {
+                reactor->schedule([h]() { h.resume(); });
+            }
+            void await_resume() const noexcept {}
+        };
+
+        ScheduleAwaitable yield() noexcept { return ScheduleAwaitable{this}; }
 
     private:
         std::deque<MoveOnlyFunction> queue_;
@@ -414,15 +428,18 @@ namespace pooriayousefi::io_bound
         AsyncSocket(const AsyncSocket &) = delete;
         AsyncSocket &operator=(const AsyncSocket &) = delete;
 
-        AsyncSocket(AsyncSocket &&other) noexcept : fd_(other.fd_), reactor_(other.reactor_) { other.fd_ = INVALID_SOCK; }
+        AsyncSocket(AsyncSocket &&other) noexcept 
+            : fd_(std::exchange(other.fd_, INVALID_SOCK))
+            , reactor_(other.reactor_) 
+        {}
+
         AsyncSocket &operator=(AsyncSocket &&other) noexcept
         {
             if (this != &other)
             {
                 close();
-                fd_ = other.fd_;
+                fd_ = std::exchange(other.fd_, INVALID_SOCK);
                 reactor_ = other.reactor_;
-                other.fd_ = INVALID_SOCK;
             }
             return *this;
         }
@@ -574,20 +591,31 @@ namespace pooriayousefi::io_bound
         socket_t write_fd_{INVALID_SOCK};
         NetworkReactor *reactor_{nullptr};
 
-#if defined(_WIN32)
-        // Windows does not support select() on anonymous pipes.
-        // To maintain async semantics without IOCP, we use a background thread
-        // that blocks on ReadFile and schedules the coroutine upon completion.
-        std::thread read_thread_;
-        std::atomic<bool> stopped_{false};
-#endif
-
     public:
         AsyncPipe() : reactor_(current_reactor) {}
         ~AsyncPipe() { close(); }
 
         AsyncPipe(const AsyncPipe &) = delete;
         AsyncPipe &operator=(const AsyncPipe &) = delete;
+
+        // FIX: Properly defined move constructors to allow std::optional<AsyncPipe> to be movable
+        AsyncPipe(AsyncPipe &&other) noexcept
+            : read_fd_(std::exchange(other.read_fd_, INVALID_SOCK))
+            , write_fd_(std::exchange(other.write_fd_, INVALID_SOCK))
+            , reactor_(other.reactor_)
+        {}
+
+        AsyncPipe &operator=(AsyncPipe &&other) noexcept
+        {
+            if (this != &other)
+            {
+                close();
+                read_fd_ = std::exchange(other.read_fd_, INVALID_SOCK);
+                write_fd_ = std::exchange(other.write_fd_, INVALID_SOCK);
+                reactor_ = other.reactor_;
+            }
+            return *this;
+        }
 
         void assign_write(socket_t fd)
         {
@@ -609,11 +637,6 @@ namespace pooriayousefi::io_bound
 
         void close()
         {
-#if defined(_WIN32)
-            stopped_.store(true);
-            if (read_thread_.joinable())
-                read_thread_.join();
-#endif
             if (reactor_)
             {
                 if (read_fd_ != INVALID_SOCK)
@@ -695,58 +718,48 @@ namespace pooriayousefi::io_bound
             }
 
 #if defined(_WIN32)
-            // Windows pipe workaround: spawn a thread to block on ReadFile.
-            // When data arrives, it schedules the coroutine handle back to the reactor.
+            // Windows pipe workaround: Use PeekNamedPipe to poll for data without blocking,
+            // yielding to the reactor when no data is available.
             HANDLE hRead = reinterpret_cast<HANDLE>(read_fd_);
-            auto prom = std::make_shared<std::promise<std::expected<size_t, std::error_code>>>();
-            auto fut = prom->get_future();
+            while (true)
+            {
+                DWORD bytes_available = 0;
+                BOOL success = PeekNamedPipe(
+                    hRead,
+                    nullptr,
+                    0,
+                    nullptr,
+                    &bytes_available,
+                    nullptr
+                );
 
-            if (read_thread_.joinable()) read_thread_.join();
-            stopped_.store(false);
+                if (!success)
+                {
+                    co_return std::unexpected(std::make_error_code(std::errc::broken_pipe));
+                }
 
-            read_thread_ = std::thread([this, hRead, buf, prom]() {
-                DWORD bytes_read = 0;
-                while (!stopped_.load()) {
-                    BOOL success = ReadFile(
+                if (bytes_available > 0)
+                {
+                    DWORD to_read = static_cast<DWORD>(std::min<DWORD>(bytes_available, static_cast<DWORD>(buf.size())));
+                    DWORD bytes_read = 0;
+                    success = ReadFile(
                         hRead,
                         buf.data(),
-                        static_cast<DWORD>(buf.size()),
+                        to_read,
                         &bytes_read,
                         nullptr
                     );
-                    if (success && bytes_read > 0) {
-                        if (reactor_) {
-                            reactor_->schedule([prom, bytes_read]() {
-                                prom->set_value(static_cast<size_t>(bytes_read));
-                            });
-                        }
-                        return;
-                    }
-                    if (!success) {
-                        DWORD err = GetLastError();
-                        if (err == ERROR_HANDLE_EOF || err == ERROR_BROKEN_PIPE) {
-                            if (reactor_) {
-                                reactor_->schedule([prom]() {
-                                    prom->set_value(0);
-                                });
-                            }
-                            return;
-                        }
-                        // For other errors, retry or exit
-                        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                    } else {
-                        // bytes_read == 0 but success: likely pipe closed or EOF
-                        if (reactor_) {
-                            reactor_->schedule([prom]() {
-                                prom->set_value(0);
-                            });
-                        }
-                        return;
-                    }
-                }
-            });
 
-            co_return fut.get();
+                    if (success)
+                    {
+                        co_return static_cast<size_t>(bytes_read);
+                    }
+                    co_return std::unexpected(std::make_error_code(std::errc::io_error));
+                }
+
+                // No data available, yield execution to the reactor
+                co_await reactor_->yield();
+            }
 #else
             while (true)
             {
