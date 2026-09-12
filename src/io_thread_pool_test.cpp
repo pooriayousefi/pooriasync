@@ -326,7 +326,6 @@ bool test_async_pipe_ipc()
     {
         AsyncPipe pipe{NetworkReactor::current};
 
-#ifndef _WIN32
         // On POSIX, create a real pipe for testing.
         int fds[2];
         if (::pipe(fds) != 0)
@@ -335,21 +334,6 @@ bool test_async_pipe_ipc()
         }
         pipe.assign_read(fds[0]);
         pipe.assign_write(fds[1]);
-#else
-        // On Windows, create a real anonymous pipe.
-        HANDLE read_handle;
-        HANDLE write_handle;
-        SECURITY_ATTRIBUTES sa;
-        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
-        sa.bInheritHandle = TRUE;
-        sa.lpSecurityDescriptor = nullptr;
-        if (!CreatePipe(&read_handle, &write_handle, &sa, 0))
-        {
-            co_return std::unexpected(std::make_error_code(std::errc::io_error));
-        }
-        pipe.assign_read(static_cast<socket_t>(reinterpret_cast<uintptr_t>(read_handle)));
-        pipe.assign_write(static_cast<socket_t>(reinterpret_cast<uintptr_t>(write_handle)));
-#endif
 
         std::string_view message = "hello pipe!";
         auto send_result = co_await pipe.send(std::as_bytes(std::span{message}));

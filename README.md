@@ -1,26 +1,16 @@
 
 # PooriAsync
 
-A two-header, dependency-free C++23 coroutine and async I/O library. `asyncore.hpp` provides foundational coroutine primitives (`AsyncTask`, `AsyncGenerator`, `FireAndForget`, `sync_wait`, `CancellationToken`, `MoveOnlyFunction`). `io_thread_pool.hpp` builds on this with a cross-platform `NetworkReactor` (epoll/kqueue/select), `AsyncSocket`, `AsyncPipe`, and a `ThreadPool` — all with strict memory safety (`std::span`) and explicit error handling (`std::expected`).
+A header-only, dependency-free C++23 async runtime combining coroutine primitives, a work-stealing CPU thread pool, an epoll/kqueue I/O reactor, and RAII process management — all in four headers with zero external dependencies.
 
-```cpp
-#include "io_thread_pool.hpp"
-
-using namespace pooriayousefi::core;
-using namespace pooriayousefi::io_bound;
-
-ThreadPool pool{4};
-
-AsyncTask<int> compute() {
-    co_await pool.schedule(); // Hop to a worker thread
-    co_return 42;
-}
-
-int main() {
-    std::future<int> fut = pool.run(compute());
-    std::println("Result: {}", fut.get());
-}
 ```
+asyncore.hpp           → Coroutine primitives (AsyncTask, DetachedTask, ...)
+io_thread_pool.hpp     → I/O-bound pool (epoll/kqueue reactor, AsyncSocket, AsyncPipe)
+cpu_thread_pool.hpp    → CPU-bound pool (Chase-Lev work-stealing, TaskGroup)
+process.hpp            → Process management (fork/exec/waitpid, RAII, no zombies)
+```
+
+**Unix-only (Linux / Mac / BSD). Windows users: use WSL2.**
 
 ---
 
@@ -28,42 +18,185 @@ int main() {
 
 - [PooriAsync](#pooriasync)
   - [Table of contents](#table-of-contents)
+  - [Why PooriAsync?](#why-pooriasync)
+  - [Which Thread Pool Should I Use?](#which-thread-pool-should-i-use)
+    - [Decision Flowchart](#decision-flowchart)
+  - [Architecture](#architecture)
   - [Features](#features)
+    - [`asyncore.hpp` — Coroutine Foundation](#asyncorehpp--coroutine-foundation)
+    - [`io_thread_pool.hpp` — I/O-Bound Pool](#io_thread_poolhpp--io-bound-pool)
+    - [`cpu_thread_pool.hpp` — CPU-Bound Pool](#cpu_thread_poolhpp--cpu-bound-pool)
+    - [`process.hpp` — Process Management](#processhpp--process-management)
   - [Requirements](#requirements)
   - [Project Structure](#project-structure)
   - [Building](#building)
-  - [Architecture](#architecture)
-  - [Core Types (asyncore.hpp)](#core-types-asyncorehpp)
-  - [IO Types (io\_thread\_pool.hpp)](#io-types-io_thread_poolhpp)
+  - [Core Components](#core-components)
   - [Usage](#usage)
-    - [AsyncTask and DetachedTask](#asynctask-and-detachedtask)
-    - [AsyncGenerator](#asyncgenerator)
-    - [FireAndForget](#fireandforget)
-    - [Thread Pool Scheduling](#thread-pool-scheduling)
-    - [Network Reactor and Sockets](#network-reactor-and-sockets)
-    - [Async IPC Pipes](#async-ipc-pipes)
-    - [Cancellation](#cancellation)
+    - [Coroutine Primitives (asyncore.hpp)](#coroutine-primitives-asyncorehpp)
+    - [I/O Thread Pool (io\_thread\_pool.hpp)](#io-thread-pool-io_thread_poolhpp)
+    - [CPU Thread Pool (cpu\_thread\_pool.hpp)](#cpu-thread-pool-cpu_thread_poolhpp)
+    - [Process Management (process.hpp)](#process-management-processhpp)
+    - [Combining I/O + CPU + Process (Real-World)](#combining-io--cpu--process-real-world)
+  - [Comparison](#comparison)
   - [Limitations and Gotchas](#limitations-and-gotchas)
   - [License](#license)
 
 ---
 
+## Why PooriAsync?
+
+Most C++ async libraries force you into a single model — either `boost::asio` (I/O-centric, callback-heavy) or a raw thread pool (CPU-centric, no reactor). PooriAsync gives you **both** under one roof, with native C++23 coroutines throughout:
+
+| Layer | Typical Library | PooriAsync |
+|-------|----------------|------------|
+| Coroutines | `boost::asio::awaitable` (tied to asio) | `asyncore.hpp` — standalone `AsyncTask<T>`, `DetachedTask`, `FireAndForget` |
+| I/O reactor | `boost::asio` io_context (~500KB) | `io_thread_pool.hpp` — epoll/kqueue, ~500 LOC, zero deps |
+| CPU scheduling | `boost::asio::thread_pool` (no work-stealing) | `cpu_thread_pool.hpp` — Chase-Lev work-stealing deque |
+| Process mgmt | `boost::process` (heavy dep) | `process.hpp` — RAII, no zombies, noexcept terminate |
+| HTTP client | `libcurl` or `cpp-httplib` | `AsyncHTTPClient` (in poorimcp, built on `AsyncSocket`) |
+| Structured concurrency | None (C++26 proposal) | `TaskGroup` — spawn + wait + exception propagation |
+| Cancellation | None (ad-hoc `atomic<bool>`) | `CancellationToken` — thread-safe, `throw_if_cancelled()` |
+
+**No `boost`. No `asio`. No `libuv`. No `libcurl`. No exceptions for control flow.**
+
+---
+
+## Which Thread Pool Should I Use?
+
+| Scenario | Use | Why |
+|----------|-----|-----|
+| **Network server / client** | `io_bound::ThreadPool` | epoll/kqueue reactor detects socket readiness; coroutines suspend until data arrives; no CPU wasted spinning |
+| **HTTP API calls** | `io_bound::ThreadPool` | `AsyncHTTPClient` uses `AsyncSocket` — non-blocking connect/send/recv with reactor-driven resumption |
+| **IPC / stdio pipes** | `io_bound::ThreadPool` | `AsyncPipe` registers pipe fds with epoll/kqueue; child process output streams without blocking |
+| **Number crunching** | `cpu_bound::ThreadPool` | Chase-Lev work-stealing deque keeps CPU cache hot; no reactor overhead; `submit()` returns `std::future` |
+| **Data processing pipelines** | `cpu_bound::ThreadPool` | `TaskGroup` for structured concurrency — spawn parallel stages, `co_await group.wait()` |
+| **Mixed I/O + CPU** | **Both** | I/O pool handles network; CPU pool handles computation; communicate via `std::future` or shared state |
+| **Spawning child processes** | `process::Process` | RAII wrapper — no zombies, noexcept `terminate()`, idempotent `wait()` |
+| **Fire-and-forget background tasks** | Either pool's `spawn()` | `DetachedTask` auto-destroys on completion; no leaks, no manual cleanup |
+
+### Decision Flowchart
+
+```
+Is the work I/O-bound (network, pipes, files)?
+├── Yes → io_bound::ThreadPool
+│         (epoll/kqueue reactor, AsyncSocket, AsyncPipe)
+│
+└── No → Is it CPU-bound (computation, algorithms)?
+    ├── Yes → cpu_bound::ThreadPool
+    │         (Chase-Lev work-stealing, TaskGroup)
+    │
+    └── No → Do you need to spawn processes?
+        └── Yes → process::Process
+                  (fork/exec/waitpid, RAII)
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                      asyncore.hpp                            │
+│   AsyncTask<T>  DetachedTask  FireAndForget  AsyncGenerator  │
+│   CancellationToken  MoveOnlyFunction  sync_wait()           │
+└────────────────────────┬─────────────────────────────────────┘
+                         │
+          ┌──────────────┴──────────────┐
+          │                             │
+          ▼                             ▼
+┌──────────────────────┐   ┌──────────────────────────┐
+│  io_thread_pool.hpp  │   │   cpu_thread_pool.hpp    │
+│                      │   │                          │
+│  NetworkReactor      │   │  ChaseLevDeque           │
+│   (epoll / kqueue)   │   │   (lock-free work-steal) │
+│  AsyncSocket         │   │  ThreadPool              │
+│   (TCP send/recv)    │   │   (run / spawn / submit) │
+│  AsyncPipe           │   │  TaskGroup               │
+│   (IPC send/recv)    │   │   (structured conc.)     │
+│  ThreadPool          │   │                          │
+│   (run / submit)     │   │  No reactor — pure CPU   │
+│                      │   │  Work-stealing scheduler │
+│  Reactor-driven      │   │                          │
+│  event loop          │   │                          │
+└──────────────────────┘   └──────────────────────────┘
+
+┌──────────────────────┐
+│     process.hpp      │
+│                      │
+│  Process (RAII)      │
+│   fork + execvp      │
+│   waitpid            │
+│   kill(SIGTERM)      │
+│   close_stdin()      │
+│                      │
+│  FileDescriptor      │
+│   (RAII fd wrapper)  │
+│                      │
+│  No zombies          │
+│  Noexcept terminate  │
+│  Idempotent wait     │
+└──────────────────────┘
+```
+
+---
+
 ## Features
 
-- **C++23 Coroutines:** `AsyncTask<T>`, `AsyncGenerator<T>`, `FireAndForget`, and `DetachedTask` primitives with symmetric transfer for zero-overhead continuations.
-- **Cross-Platform Reactor:** `NetworkReactor` wraps `epoll` (Linux), `kqueue` (Mac/BSD), and `select` (Windows) behind a unified, non-blocking API.
-- **Integrated Thread Pool:** A multi-worker thread pool that drives the reactor and executes coroutines asynchronously. Round-robin scheduling with `DetachedTask` for safe, leak-free coroutine execution.
-- **Async IPC (`AsyncPipe`):** Non-blocking inter-process communication for `stdio` transport, fully integrated with the reactor event loop.
-- **Async TCP (`AsyncSocket`):** Non-blocking connect, send, and recv with `std::expected` error handling.
-- **Enterprise-Grade Safety:** Uses `std::span` for buffer memory safety and `std::expected` for exception-free, explicit error propagation in network and pipe I/O.
-- **Cancellation Support:** `CancellationToken` with `cancel()`, `is_cancelled()`, and `throw_if_cancelled()`.
-- **MoveOnlyFunction:** Type-erased, move-only callable wrapper (replacement for `std::function` when capturing move-only types).
-- **Zero Dependencies:** Relies only on the C++23 standard library, `asyncore.hpp`, and native OS networking APIs.
+### `asyncore.hpp` — Coroutine Foundation
+
+- **`AsyncTask<T>`** — lazy coroutine returning `T`; awaitable with symmetric transfer
+- **`AsyncTask<void>`** — void specialization
+- **`AsyncGenerator<T>`** — lazy coroutine yielding multiple values; iterable
+- **`FireAndForget`** — eager coroutine (starts immediately); self-managed lifetime
+- **`DetachedTask`** — lazy coroutine (starts suspended); auto-destroys frame on completion — no leaks, no UB
+- **`SyncWaitTask<T>`** + **`sync_wait()`** — block calling thread until coroutine completes
+- **`CancellationToken`** — thread-safe, one-way cancel flag; `cancel()`, `is_cancelled()`, `throw_if_cancelled()`
+- **`CancelledException`** — thrown by `throw_if_cancelled()`
+- **`MoveOnlyFunction`** — type-erased, move-only callable (replaces `std::function` for move-only types)
+
+### `io_thread_pool.hpp` — I/O-Bound Pool
+
+- **`NetworkReactor`** — per-thread event loop: `epoll` (Linux), `kqueue` (Mac/BSD); 100ms timeout fallback
+- **`AsyncSocket`** — non-blocking TCP: `co_await async_connect()`, `co_await send()`, `co_await recv()`
+- **`AsyncPipe`** — non-blocking IPC: `co_await send()`, `co_await recv()`; integrates with `process.hpp`
+- **`ThreadPool`** — round-robin worker pool, each with its own `NetworkReactor`; `submit()`, `run()`, `schedule()`
+- **`std::expected<T, std::error_code>`** — all I/O returns expected, never throws
+- **`std::span<std::byte>`** — bounds-safe, zero-copy buffers
+- **Thread-local reactor** — `NetworkReactor::current` set by `run()`; `AsyncSocket`/`AsyncPipe` auto-detect
+
+### `cpu_thread_pool.hpp` — CPU-Bound Pool
+
+- **`ChaseLevDeque`** — lock-free work-stealing deque; workers pop LIFO (cache locality), stealers steal FIFO
+- **`ThreadPool`** — work-stealing scheduler with local queues + global fallback
+  - `run(AsyncTask<T>)` — returns `std::future<T>`
+  - `spawn(AsyncTask<T>)` — fire-and-forget
+  - `submit(F, Args...)` — plain callable, returns `std::future<R>`
+  - `schedule()` — `co_await` to yield to the pool (pushes to global queue for thread switch)
+  - `wait()` — block until all tasks complete
+- **`TaskGroup`** — structured concurrency: spawn multiple tasks, `co_await group.wait()`, first exception rethrown
+- **`DetachedTask`** — all coroutines use lazy start + auto-destroy; no dangling handles
+
+### `process.hpp` — Process Management
+
+- **`Process`** — RAII cross-platform process lifecycle
+  - `start(executable, args)` — `fork()` + `execvp()` (POSIX)
+  - `wait()` — `waitpid()`, returns exit code; idempotent (returns cached code if already reaped)
+  - `terminate()` — `SIGTERM` + `waitpid()`; `noexcept` — safe in destructors
+  - `running()` — `waitpid(WNOHANG)`; reaps zombies and updates state (no `ECHILD` on later `wait()`)
+  - `close_stdin()` — signals EOF to child
+  - `exit_code()` — last known exit code
+- **`FileDescriptor`** — RAII wrapper for POSIX file descriptors; move-only
+- **No zombies, no orphans** — destructor calls `terminate()` + `wait()` if child still running
+- **`initializer_list` convenience** — `p.start("cat", {"hello"})`
+
+---
 
 ## Requirements
 
-Requires **C++23** (`std::expected`, `std::coroutine`, `std::format`, `std::span`, `std::binary_semaphore`).
-Tested with GCC 13+, Clang 16+, and MSVC 19.34+.
+- **C++23** (`std::expected`, `std::coroutine`, `std::span`, `std::binary_semaphore`, `std::format`)
+- Clang 16+ (macOS/Linux), GCC 13+ (Linux)
+- **Unix only** — Linux (epoll), Mac/BSD (kqueue)
+- No external dependencies
 
 ## Project Structure
 
@@ -72,9 +205,13 @@ pooriasync/
 ├── bin/
 ├── include/
 │   ├── asyncore.hpp
-│   └── io_thread_pool.hpp
+│   ├── io_thread_pool.hpp
+│   ├── cpu_thread_pool.hpp
+│   └── process.hpp
 ├── src/
-│   └── main.cpp
+│   ├── io_thread_pool_test.cpp
+│   ├── cpu_thread_pool_test.cpp
+│   └── process_test.cpp
 └── README.md
 ```
 
@@ -83,189 +220,239 @@ pooriasync/
 **Mac/Linux:**
 ```bash
 mkdir -p bin
-clang++ -std=c++23 -O3 -I include src/main.cpp -o bin/pooriasync_test
-./bin/pooriasync_test
-```
 
-**Windows (PowerShell, MSVC):**
-```powershell
-if (-not (Test-Path bin)) { New-Item -ItemType Directory bin }
-cl /std:c++23 /EHsc /I include src/main.cpp ws2_32.lib /out:bin\pooriasync_test.exe
-.\bin\pooriasync_test.exe
-```
+# I/O thread pool tests
+clang++ -std=c++23 -O3 -I include src/io_thread_pool_test.cpp -o bin/io_test
+./bin/io_test
 
-> **Note:** On Windows, you must link `ws2_32.lib` (Winsock).
+# CPU thread pool tests
+clang++ -std=c++23 -O3 -I include src/cpu_thread_pool_test.cpp -o bin/cpu_test
+./bin/cpu_test
+
+# Process management tests
+clang++ -std=c++23 -O3 -I include src/process_test.cpp -o bin/process_test
+./bin/process_test
+```
 
 ---
 
-## Architecture
+## Core Components
 
-`asyncore.hpp` provides the primitive types that manage coroutine frames, promise objects, and continuations. `io_thread_pool.hpp` builds on this by providing a `NetworkReactor` that monitors OS-level file descriptors/sockets and resumes coroutines when data is ready to read/write.
-
-The `ThreadPool` distributes coroutines across worker threads. When an `AsyncSocket` or `AsyncPipe` awaits a read/write event, it registers its coroutine handle with the thread-local `NetworkReactor`, yielding execution back to the reactor's event loop so it can process other connections.
-
----
-
-## Core Types (asyncore.hpp)
-
-| Type | Description |
-|------|-------------|
-| `AsyncTask<T>` | Lazy coroutine that returns a `T`. Awaits with symmetric transfer. Move-only. |
-| `AsyncTask<void>` | Void specialization. |
-| `AsyncGenerator<T>` | Lazy coroutine that yields multiple `T` values via `co_yield`. Iterable. |
-| `FireAndForget` | Eager coroutine (starts immediately). Self-managed lifetime — destroy in destructor or detach. |
-| `DetachedTask` | Lazy coroutine (starts suspended). Auto-destroys frame on completion via `FinalAwaitable`. Used by `ThreadPool::run()`. |
-| `SyncWaitTask<T>` | Internal helper for `sync_wait()`. Uses `std::binary_semaphore` to block the calling thread. |
-| `sync_wait()` | Blocks the current thread until the awaited coroutine completes. Returns the result. |
-| `CancellationToken` | Thread-safe cancel flag (`std::atomic<bool>`). Non-copyable, non-movable. |
-| `CancelledException` | Thrown by `throw_if_cancelled()`. Inherits `std::runtime_error`. |
-| `MoveOnlyFunction` | Type-erased callable. Move-only. Wraps any callable in a `std::unique_ptr` (heap-allocated). |
-
-## IO Types (io_thread_pool.hpp)
-
-| Type | Description |
-|------|-------------|
-| `NetworkReactor` | Per-thread event loop. Uses epoll (Linux), kqueue (Mac/BSD), or select (Windows). Has `schedule()`, `register_socket()`, `deregister_socket()`, `run()`, `stop()`, `yield()`. |
-| `ThreadPool` | Round-robin pool of `NetworkReactor` workers. Has `submit()`, `run()`, `schedule()`, `enqueue_raw()`. |
-| `AsyncSocket` | Coroutine-based TCP socket with `async_connect()`, `send()`, `recv()`. Uses `std::expected` for errors. |
-| `AsyncPipe` | Coroutine-based anonymous pipe for IPC/stdio. Same API as `AsyncSocket` but for pipes. |
+| Component | Header | Namespace | Description |
+|-----------|--------|-----------|-------------|
+| `AsyncTask<T>` | `asyncore.hpp` | `core` | Lazy coroutine returning `T` |
+| `AsyncGenerator<T>` | `asyncore.hpp` | `core` | Lazy coroutine yielding multiple `T` |
+| `FireAndForget` | `asyncore.hpp` | `core` | Eager, self-managed coroutine |
+| `DetachedTask` | `asyncore.hpp` | `core` | Lazy, auto-destroying coroutine |
+| `CancellationToken` | `asyncore.hpp` | `core` | Thread-safe cancel flag |
+| `MoveOnlyFunction` | `asyncore.hpp` | `core` | Type-erased move-only callable |
+| `sync_wait()` | `asyncore.hpp` | `core` | Block until coroutine completes |
+| `NetworkReactor` | `io_thread_pool.hpp` | `io_bound` | Per-thread event loop (epoll/kqueue) |
+| `AsyncSocket` | `io_thread_pool.hpp` | `io_bound` | Non-blocking TCP with `co_await` |
+| `AsyncPipe` | `io_thread_pool.hpp` | `io_bound` | Non-blocking IPC with `co_await` |
+| `ThreadPool` (I/O) | `io_thread_pool.hpp` | `io_bound` | Round-robin reactor pool |
+| `ChaseLevDeque` | `cpu_thread_pool.hpp` | `cpu_bound` | Lock-free work-stealing deque |
+| `ThreadPool` (CPU) | `cpu_thread_pool.hpp` | `cpu_bound` | Work-stealing scheduler |
+| `TaskGroup` | `cpu_thread_pool.hpp` | `cpu_bound` | Structured concurrency |
+| `Process` | `process.hpp` | `process` | RAII process lifecycle |
+| `FileDescriptor` | `process.hpp` | `process` | RAII fd wrapper |
 
 ---
 
 ## Usage
 
-### AsyncTask and DetachedTask
-
-`AsyncTask<T>` is a lazy coroutine — it starts suspended and must be resumed by someone (e.g., `ThreadPool::run()` or `co_await`).
+### Coroutine Primitives (asyncore.hpp)
 
 ```cpp
-AsyncTask<int> compute(ThreadPool& pool) {
-    co_await pool.schedule();
+#include "asyncore.hpp"
+
+using namespace pooriayousefi::core;
+
+// AsyncTask<T> — lazy coroutine, returns a value
+AsyncTask<int> compute() {
     co_return 42;
 }
 
-// Run on the pool — returns a std::future
-std::future<int> fut = pool.run(compute(pool));
-int result = fut.get();
-```
-
-`DetachedTask` is used internally by `ThreadPool::run()`. It starts suspended, resumes on a worker thread, and auto-destroys its frame when complete — no leaks, no dangling handles.
-
-### AsyncGenerator
-
-`AsyncGenerator<T>` yields values lazily. Iteration is synchronous (the generator suspends/resumes on each `++`):
-
-```cpp
-AsyncGenerator<int> count(int n) {
+// AsyncGenerator<T> — yields multiple values
+AsyncGenerator<int> range(int n) {
     for (int i = 1; i <= n; ++i) {
         co_yield i * 10;
     }
 }
 
-for (int val : count(5)) {
-    std::cout << val << '\n';  // 10, 20, 30, 40, 50
-}
-```
-
-### FireAndForget
-
-`FireAndForget` starts **immediately** (eager). Detach to let it run independently:
-
-```cpp
-FireAndForget background_task(ThreadPool& pool, std::atomic<int>& counter) {
-    co_await pool.schedule();
-    counter.store(42, std::memory_order_release);
-}
-
-// Launch and forget:
-auto ff = background_task(pool, counter);
-ff.detach();
-```
-
-### Thread Pool Scheduling
-
-`co_await pool.schedule()` suspends the current coroutine and enqueues its resume on a worker thread:
-
-```cpp
-AsyncTask<void> worker(ThreadPool& pool) {
-    std::thread::id caller = std::this_thread::get_id();
-    co_await pool.schedule();  // Switch to a worker thread
-    std::thread::id worker = std::this_thread::get_id();
-    assert(caller != worker);
+// FireAndForget — eager start, self-managed
+FireAndForget background_task() {
+    // starts immediately when created
     co_return;
 }
+
+// sync_wait — block until done (use only on non-reactor threads)
+int result = sync_wait(compute());
 ```
 
-### Network Reactor and Sockets
-
-The `AsyncSocket` class handles TCP connections asynchronously. It uses `std::expected` to report connection or I/O errors without throwing exceptions.
+### I/O Thread Pool (io_thread_pool.hpp)
 
 ```cpp
-AsyncTask<void> connect_to_server() {
+#include "io_thread_pool.hpp"
+
+using namespace pooriayousefi::io_bound;
+using namespace pooriayousefi::core;
+
+// TCP server
+ThreadPool pool{4};
+
+auto server_task = [&]() -> AsyncTask<void> {
+    // AsyncSocket auto-detects the thread-local reactor
     AsyncSocket sock;
-    auto connect_result = co_await sock.async_connect("localhost", 8080);
+    auto connect_result = co_await sock.async_connect("example.com", 80);
     if (!connect_result) {
-        std::cerr << "Failed to connect\n";
         co_return;
     }
-    
-    std::array<std::byte, 1024> buffer{};
-    auto recv_result = co_await sock.recv(buffer);
-    if (recv_result && *recv_result > 0) {
-        // Process data
+
+    std::string request = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    co_await sock.send(std::as_bytes(std::span{request}));
+
+    std::byte buf[4096];
+    auto n = co_await sock.recv(buf);
+    if (n && *n > 0) {
+        std::string response(reinterpret_cast<const char*>(buf), *n);
     }
-}
+};
+
+auto fut = pool.run(server_task());
+fut.get();
 ```
 
-### Async IPC Pipes
-
-`AsyncPipe` allows for non-blocking communication with child processes via `stdio`. On POSIX systems, pipe file descriptors are registered directly with `epoll`/`kqueue`.
+### CPU Thread Pool (cpu_thread_pool.hpp)
 
 ```cpp
-AsyncTask<void> pipe_round_trip(AsyncPipe& pipe) {
-    std::string_view msg = "hello pipe!";
-    auto send_res = co_await pipe.send(std::as_bytes(std::span{msg}));
-    if (!send_res) { co_return; }
+#include "cpu_thread_pool.hpp"
 
-    std::byte buf[64] = {};
-    auto recv_res = co_await pipe.recv(buf);
-    if (recv_res && *recv_res > 0) {
-        std::string received(reinterpret_cast<const char*>(buf), *recv_res);
+using namespace pooriayousefi::cpu_bound;
+using namespace pooriayousefi::core;
+
+// Work-stealing pool for CPU-bound computation
+ThreadPool pool{4};
+
+// Method 1: run a coroutine
+auto compute = [&pool]() -> AsyncTask<int> {
+    co_await pool.schedule();  // yield to pool (may switch threads)
+    int sum = 0;
+    for (int i = 1; i <= 1000; ++i) {
+        sum += i;
     }
+    co_return sum;
+};
+
+std::future<int> fut = pool.run(compute());
+int result = fut.get();
+
+// Method 2: submit a plain callable
+auto fut2 = pool.submit([](int a, int b) {
+    return a * b;
+}, 6, 7);
+
+// Method 3: structured concurrency
+TaskGroup group{pool};
+std::atomic<int> total{0};
+
+for (int i = 1; i <= 10; ++i) {
+    group.spawn([&pool, &total, i]() -> AsyncTask<void> {
+        co_await pool.schedule();
+        total.fetch_add(i, std::memory_order_relaxed);
+    });
 }
+
+// Wait for all — rethrows first exception if any
+auto waiter = [&group]() -> AsyncTask<void> {
+    co_await group.wait();
+};
+pool.run(waiter()).get();
 ```
 
-### Cancellation
-
-`CancellationToken` is a thread-safe, one-way cancel flag:
+### Process Management (process.hpp)
 
 ```cpp
-CancellationToken token;
+#include "process.hpp"
 
-// Check:
-if (token.is_cancelled()) { /* abort */ }
+using namespace pooriayousefi::process;
 
-// Throw:
-token.throw_if_cancelled();  // throws CancelledException
+// Spawn a child process with piped stdin/stdout
+Process p;
+p.start("/bin/cat", {});
 
-// Cancel from another thread:
-token.cancel();
+// Write to child's stdin
+::write(p.get_stdin_write(), "hello\n", 6);
+p.close_stdin();  // signal EOF so cat exits
+
+// Read from child's stdout
+char buf[256];
+ssize_t n = ::read(p.get_stdout_read(), buf, sizeof(buf));
+
+// Wait for exit
+int code = p.wait();
+// code == 0
+
+// Or terminate if still running
+// p.terminate();  // noexcept — safe in destructors
 ```
+
+### Combining I/O + CPU + Process (Real-World)
+
+```cpp
+#include "io_thread_pool.hpp"
+#include "cpu_thread_pool.hpp"
+#include "process.hpp"
+
+using namespace pooriayousefi;
+
+// I/O pool for network, CPU pool for computation
+io_bound::ThreadPool io_pool{2};  // fewer threads — I/O is mostly waiting
+cpu_bound::ThreadPool cpu_pool{4}; // more threads — CPU-bound work
+
+// Spawn an MCP server as a subprocess
+process::Process mcp_server;
+mcp_server.start("npx", {"-y", "@modelcontextprotocol/server-filesystem", "/tmp"});
+
+// Use AsyncPipe (on io_pool's reactor) to communicate with the subprocess
+// Use cpu_pool to run heavy computation on the data received
+```
+
+---
+
+## Comparison
+
+| Feature | PooriAsync | boost::asio | libuv | tokio (Rust) |
+|---------|-----------|-------------|-------|-------------|
+| **Dependencies** | Zero | Boost (~20MB) | libuv (~1MB) | Rust stdlib + tokio |
+| **Coroutines** | C++23 native | `co_await` (asio-specific) | Callbacks | `async/await` |
+| **I/O reactor** | epoll/kqueue | epoll/kqueue/io_uring | epoll/kqueue | epoll/kqueue/io_uring |
+| **CPU work-stealing** | Chase-Lev deque | No (thread_pool only) | No | Yes (tokio + rayon) |
+| **Structured concurrency** | `TaskGroup` | No | No | `JoinSet` |
+| **Process mgmt** | RAII, no zombies | `boost::process` (heavy) | `uv_spawn` | `std::process::Command` |
+| **Cancellation** | `CancellationToken` | No | `uv_cancel_t` | `CancellationToken` |
+| **Error handling** | `std::expected` | Exceptions / `error_code` | int return codes | `Result<T, E>` |
+| **Header-only** | Yes | No (compiled lib) | No | No |
+| **Binary size** | Minimal | ~500KB+ | ~100KB+ | Large |
+| **Compile time** | Fast | Slow (template explosion) | Fast | Fast |
+| **Platform** | Unix only | Cross-platform | Cross-platform | Cross-platform |
 
 ---
 
 ## Limitations and Gotchas
 
-1. **Windows `select` limit:** On Windows, the reactor uses `select()` for sockets, which is limited to `FD_SETSIZE` (usually 1024) concurrent sockets.
-2. **Windows IPC Pipes:** `AsyncPipe` on Windows uses `PeekNamedPipe` + `co_await reactor->yield()` polling, because anonymous pipes are not compatible with `select()`. For high-performance Windows IPC, IOCP is required.
-3. **Windows `wake_up()`:** There is no wake mechanism on Windows. The reactor relies on a 100ms `select()` timeout to pick up newly scheduled tasks. This adds up to 100ms latency for task scheduling on Windows.
-4. **`sync_wait` Deadlocks:** Calling `sync_wait` on an `AsyncTask` *inside* a `NetworkReactor::run()` loop will deadlock the reactor thread. `sync_wait` should only be used on main/CLI threads or outside the reactor's execution context.
-5. **Thread-Local Reactor:** `AsyncSocket` and `AsyncPipe` rely on `NetworkReactor::current` (thread-local), which is set inside `NetworkReactor::run()`. You cannot use them on a thread that is not part of the `ThreadPool`.
-6. **Coroutine Lifetime:** `FireAndForget` coroutines start eagerly and self-manage their frame. Ensure they do not capture references to local variables that might go out of scope. `DetachedTask` starts suspended and auto-destroys on completion — safe for cross-thread resume.
-7. **`AsyncTask` move assignment deleted:** `AsyncTask` can be moved but not reassigned. This prevents reassignment of an active task that might be mid-await.
-8. **`MoveOnlyFunction` always heap-allocates:** No small-buffer-optimization (SBO). Every callable is wrapped in a `std::unique_ptr`. For high-frequency task dispatch, consider a pooled allocator.
-9. **`std::strerror` not thread-safe:** Error messages in `pooriprocess.hpp` use `strerror(errno)` which writes to a static buffer. The message is consumed immediately, so the race window is minimal.
-10. **macOS `kevent` timeout:** The reactor uses a 100ms `timespec` timeout on macOS to prevent indefinite blocking when no events arrive. This ensures `stopped_` is checked regularly.
+1. **Unix only.** Linux (epoll) and Mac/BSD (kqueue). No Windows native support — use WSL2.
+2. **No TLS/SSL.** `AsyncSocket` is plaintext TCP. For TLS, layer OpenSSL on top.
+3. **No chunked HTTP.** `AsyncHTTPClient` (in `poorimcp.hpp`) uses `Connection: close`. For keep-alive or chunked encoding, extend the client.
+4. **`sync_wait` deadlocks.** Calling `sync_wait` inside a reactor thread blocks that thread. Use `ThreadPool::run()` instead.
+5. **Thread-local reactor.** `AsyncSocket` and `AsyncPipe` rely on `NetworkReactor::current`. You cannot use them on a thread not running `NetworkReactor::run()`.
+6. **Coroutine frame heap allocation.** Each `co_await` creates a frame on the heap. For ultra-low-latency, add a pooled allocator.
+7. **`wait()` can deadlock.** Calling `cpu_bound::ThreadPool::wait()` from a worker thread blocks that worker. Call only from non-worker threads.
+8. **Object key order is unspecified.** JSON objects use `std::unordered_map` — key order varies between runs.
+9. **`TaskGroup` stores only first exception.** Subsequent exceptions are swallowed.
+10. **`ChaseLevDeque` has fixed capacity (1024).** Overflow falls back to the global queue — no data loss, but reduced locality.
+11. **`Process` destructor terminates running children.** If the `Process` object is destroyed while the child is still running, it sends `SIGTERM` and reaps. Call `wait()` first for graceful shutdown.
+12. **No `stderr` pipe.** `Process` pipes stdin and stdout only. stderr is inherited from the parent.
 
 ---
 
