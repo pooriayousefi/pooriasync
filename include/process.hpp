@@ -1,5 +1,5 @@
 // ============================================================================
-//  pooriprocess.hpp — Cross-Platform Process Management (Enhanced for Async IO)
+//  process.hpp — Cross-Platform Process Management (Enhanced for Async IO)
 //  Developed by: Pooria Yousefi
 //  License: Apache 2.0
 // ============================================================================
